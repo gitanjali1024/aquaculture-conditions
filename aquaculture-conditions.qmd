@@ -1,0 +1,207 @@
+# Aquaculture Conditions off the West Coast
+
+Marine aquaculture is increasingly seen as a way to meet growing global demand for seafood while reducing pressure on wild fisheries, which can deplete populations and harm ecosystems. It is important to identify what species can be farmed in what areas, based on environmental conditions, and identifying those locations is fundamentally a spatial problem.
+
+This analysis asks which Exclusive Economic Zones (EEZs) along the U.S. West Coast are best suited to marine aquaculture for two species: oysters and sardines. Suitability is defined by two environmental constraints, sea surface temperature (SST) and ocean depth, each of which must fall within the species’ tolerable range. Oysters require SST between 11 and 30 °C and depths between 0 and 70 m below sea level. For Pacific sardine, I used an SST range of  13-22°C and a depth range of 13-22 m, based on SeaLifeBase.
+
+To answer this, I combined average annual SST from 2008–2012, bathymetry, and West Coast EEZ boundaries. After aligning the rasters to a common resolution, extent, and coordinate reference system, I reclassified each layer into suitable and unsuitable cells, combined them with map algebra, and summed the area of suitable cells within each EEZ. I wrapped the full workflow in a reusable function, so the same analysis can be run for any species given its temperature and depth limits.
+
+## Load Libraries
+```{r}
+#| warning: false
+#| message: false
+library(sf)        
+library(terra)       
+library(tidyverse)
+library(tmap)       
+library(viridisLite)
+```
+
+## Read in data
+```{r}
+#| warning: false
+#| message: false
+
+regions <- st_read("data/wc_regions_clean.shp")
+
+depth <- rast("data/depth.tif")
+
+sst_2008 <- rast("data/average_annual_sst_2008.tif")
+sst_2009 <- rast("data/average_annual_sst_2009.tif")
+sst_2010 <- rast("data/average_annual_sst_2010.tif")
+sst_2011 <- rast("data/average_annual_sst_2011.tif")
+sst_2012 <- rast("data/average_annual_sst_2012.tif")
+
+```
+
+## Wrangle sst and depth rasters
+```{r}
+#| warning: false
+#| message: false
+
+# Stack the rasters
+sst <- c(sst_2008, sst_2009, sst_2010, sst_2011, sst_2012)
+
+# Find mean sst and convert to Kelvin
+average_sst <- mean(sst, na.rm = TRUE) - 273.15
+
+
+# Resample depth to match sst resolution
+depth_resample <- resample(depth, average_sst, method = "bilinear")
+
+```
+
+## Check extents and CRS
+```{r}
+#| warning: false
+#| message: false
+
+# Ensure same resolution, extent and CRS
+if (all(res(average_sst) == res(depth_resample))) {
+  print("The resolutions match")
+} else {
+  warning("Update resolutions to match")
+  res(depth_resample) <- res(average_sst)
+}
+
+if (ext(average_sst) == ext(depth_resample)) {
+  print("The extents match")
+} else {
+  warning("Update extents to match")
+  ext(depth_resample) <- ext(average_sst)
+}
+
+if (crs(average_sst) == crs(depth_resample)) {
+  print("The CRSs match")
+} else {
+  warning("Update CRSs to match")
+  crs(depth_resample) <- crs(average_sst)
+}
+
+```
+
+## Create a function to produce suitable area maps
+```{r}
+#| warning: false
+#| message: false
+
+suitable_zones <- function(
+  min_sst,
+  max_sst,
+  min_depth,
+  max_depth,
+  species_name
+) {
+  # Reclassify SST
+  sst_reclassify <- matrix(
+    c(
+      -Inf, min_sst, 0,
+      min_sst, max_sst, 1,
+      max_sst, Inf, 0
+      ),
+    ncol = 3, byrow = TRUE
+  )
+
+  # Apply classification to raster layer
+  sst_zonal <- classify(average_sst, rcl = sst_reclassify)
+
+  # Reclassify depth 
+  depth_reclassify <- matrix(
+    c(
+      -Inf, -max_depth, 0,
+      -max_depth, -min_depth, 1,
+      -min_depth, Inf, 0
+    ),
+    ncol = 3,
+    byrow = TRUE
+  )
+
+  # Apply classification to raster layer
+  depth_zones <- classify(depth_resample, rcl = depth_reclassify)
+
+  # Find areas that satisfy both conditions
+  species_stack <- c(sst_zonal, depth_zones)
+
+  # Create function to find suitable area
+  suitable_area <- lapp(species_stack, fun = function(sst, depth) {
+    sst * depth
+  })
+
+  # Rasterize
+  regions_raster <- rasterize(vect(regions), suitable_area, field = "rgn_id")
+
+  # Calculate area 
+  cell_area <- cellSize(suitable_area, unit = "km", mask = TRUE)
+
+  # Keep only suitable area
+  suitable_cell_area <- mask(cell_area, suitable_area, maskvalues = 0)
+
+  # Select raster cells in EEZ regions
+  suitable_cell_area_eez <- zonal(
+    suitable_cell_area,
+    regions_raster,
+    fun = "sum",
+    na.rm = TRUE
+  )
+
+  # Convert into dataframe
+  suitability_df <- as_tibble(suitable_cell_area_eez) |>
+    rename(suitable_area_km2 = area) # rename column name
+
+  # Join suitable areas to polygons
+  eez_map <- left_join(regions, suitability_df, by = "rgn_id")
+
+  # Map the data
+  tm_shape(eez_map) +
+    tm_basemap("OpenStreetMap") +
+    tm_fill(
+      fill_alpha = 0.5,
+      fill = "suitable_area_km2",
+      fill.legend = tm_legend(
+        "Suitable Area (km²)",
+        position = tm_pos_out("left", "center")
+      )
+    ) +
+    tm_scalebar(
+      position = c("right", "bottom"),
+    ) +
+    tm_compass(
+      position = c("right", "top"),
+    ) +
+    tm_title(
+      paste("Suitable Aquaculture Conditions Areas for", species_name, "by EEZ")
+    )}
+```
+
+##  Call function for desired species
+```{r}
+#| warning: false
+#| message: false
+
+# Suitable zones map for oysters
+suitable_zones(
+  min_sst = 11,
+  max_sst = 30,
+  min_depth = 0,
+  max_depth = 70,
+  species_name = "Oysters"
+)
+```
+
+```{r}
+#| warning: false
+#| message: false
+
+# Suitable zones map for sardines
+suitable_zones(
+  min_sst = 13,
+  max_sst = 22,
+  min_depth = 15,
+  max_depth = 100,
+  species_name = "Sardines"
+)
+```
+
+For oysters, the second most southern region (off of northern CA) had the most suitable habitat between 4,000 and 5000 km^2, while the region directly above had the least, with under 1,000 km^2. Because oysters are limited to shallow water (0–70 m), suitable area is concentrated along the coastline, favoring EEZs with broader continental shelves. For sardines, the most southern regions off of southern CA ranked highest with 3,000 to 4,000 km^2 of suitable area. Sardines’ deeper depth tolerance extends suitable habitat farther offshore, while their narrower temperature range limits them to the warm southern zone. 
+
+This analysis considers only temperature and depth. It leaves out other important factors such as dissolved oxygen, shipping traffic, and protected areas. Averaging SST across 2008–2012 also hides seasonal extremes, and Pacific sardine is primarily wild-caught, so its results show where conditions are technically suitable rather than where farming could actually occur. However, the generalized function still provides a good starting point that can be extended with more environmental layers or applied to other species.
